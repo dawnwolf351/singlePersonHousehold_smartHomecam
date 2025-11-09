@@ -1,35 +1,48 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-MQTT_SUBSCRIBER.PY: AI 감지 이벤트를 MQTT 브로커에서 비동기로 구독하여 수신하는 모듈
+MQTT_SUBSCRIBER.PY: AI 감지 이벤트를 구독하고 MongoDB에 로그로 저장하는 모듈
 ================================================================================
 """
 import paho.mqtt.client as mqtt
 import json
 import time
-from config import MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_ALERT_TOPIC  # MQTT 설정 정보 임포트
+from pymongo import MongoClient
+from datetime import datetime, timezone  # BSON UTC datetime 생성을 위해 임포트
+from config import (
+    MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_ALERT_TOPIC,
+    MONGO_URI, DB_NAME, COLLECTION_NAME  # DB 및 MQTT 설정 임포트
+)
 
 
 class MqttSubscriber:
     """
     MQTT 구독자 클라이언트 클래스.
-    백그라운드 스레드를 사용하여 브로커로부터 알림을 독립적으로 수신합니다.
+    비동기 알림 수신 및 MongoDB 로그 저장을 담당합니다.
     """
 
     def __init__(self, client_id="AI_Detector_Subscriber"):
-        # 1. 클라이언트 인스턴스 생성 (Callback API v2 사용)
+        # 1. MQTT 클라이언트 초기화 (Callback API v2 사용)
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
-
-        # 2. 콜백 함수 등록
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
         self.connected = False
+        self.mongo_client = None
+
+        # 2. MongoDB 클라이언트 연결
+        try:
+            self.mongo_client = MongoClient(MONGO_URI)
+            self.db = self.mongo_client[DB_NAME]
+            self.collection = self.db[COLLECTION_NAME]
+            print(f"INFO: MongoDB 연결 성공. DB: '{DB_NAME}'")
+        except Exception as e:
+            print(f"ERROR: MongoDB 연결 실패: {e}")
+            self.mongo_client = None
 
         print("INFO: MQTT 구독자 초기화 완료.")
 
-    # 수정된 부분: properties 인자 추가 (API v2 필수)
     def _on_connect(self, client, userdata, flags, rc, properties):
-        """브로커 연결 완료/실패 시 호출되며, 성공 시 토픽을 구독합니다."""
+        """브로커 연결 콜백: 성공 시 토픽 구독"""
         if rc == 0:
             print(f"INFO: MQTT SUB 브로커 연결 성공: {MQTT_BROKER_HOST}:{MQTT_BROKER_PORT}")
             self.connected = True
@@ -45,31 +58,36 @@ class MqttSubscriber:
             self.connected = False
 
     def _on_message(self, client, userdata, msg):
-        """구독한 토픽에서 메시지를 수신했을 때 호출되어 알림을 처리합니다."""
+        """메시지 수신 콜백: JSON 파싱 및 MongoDB 저장"""
         try:
-            # 수신된 페이로드를 JSON 객체로 파싱
+            # 1. 수신된 페이로드를 JSON 객체로 파싱
             alert_message = json.loads(msg.payload.decode('utf-8'))
 
-            # --- 알림 처리 로직 ---
+            # 2. MongoDB 저장 로직
+            if self.mongo_client:
+                # MongoDB Time-Series 컬렉션 요구사항에 맞게 'timestamp' 필드에
+                # BSON UTC datetime 객체를 저장 (발행자 메시지에 'timestamp'가 있어도 덮어씀)
+                alert_message['timestamp'] = datetime.now(timezone.utc)
 
-            # TODO: 여기에 데이터베이스 저장, 외부 알림 전송 등의 실제 로직 구현
+                result = self.collection.insert_one(alert_message)
+                print(f"INFO: MongoDB 저장 성공. Document ID: {result.inserted_id}")
+            else:
+                print("WARN: MongoDB 연결 없음. 로그 저장을 건너뜁니다.")
 
-            # 수신된 메시지를 콘솔에 출력
+            # 3. 수신 확인을 위한 콘솔 출력
             print("\n--- 수신된 AI 감지 알림 ---")
-            print(f"토픽: {msg.topic}")
             print(f"상태: {alert_message.get('status')} (장소: {alert_message.get('location')})")
             print(f"신뢰도: {alert_message.get('confidence'):.2f}, 프레임 ID: {alert_message.get('event_id')}")
             print("------------------------------")
 
         except json.JSONDecodeError:
-            print(f"ERROR: 수신된 페이로드 JSON 디코딩 실패. 페이로드: {msg.payload}")
+            print(f"ERROR: 페이로드 디코딩 실패.")
         except Exception as e:
-            print(f"ERROR: 메시지 처리 중 오류 발생: {e}")
+            print(f"ERROR: 메시지 처리 또는 MongoDB 저장 중 오류 발생: {e}")
 
     def start(self):
-        """클라이언트를 시작하고 백그라운드 스레드에서 MQTT 루프를 실행합니다."""
+        """MQTT 클라이언트 연결 및 백그라운드 루프 시작"""
         try:
-            # 브로커에 연결 및 백그라운드 루프 시작 (비동기 처리)
             self.client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, 60)
             self.client.loop_start()
             print("INFO: MQTT 구독자 클라이언트 시작됨.")
@@ -78,23 +96,25 @@ class MqttSubscriber:
             self.connected = False
 
     def stop(self):
-        """클라이언트 루프와 연결을 안전하게 종료합니다."""
+        """MQTT 및 MongoDB 연결 안전하게 종료"""
         self.client.loop_stop()
         self.client.disconnect()
+        if self.mongo_client:
+            self.mongo_client.close()
         print("INFO: MQTT 구독자 클라이언트 종료됨.")
 
 
 # ==============================================================================
-## 테스트를 위한 메인 실행 블록
+## 독립 실행 시 테스트 로직
 # ==============================================================================
 if __name__ == '__main__':
-    # 파일을 단독으로 실행할 때 구독 기능 테스트에 사용됨
+    # 파일을 단독으로 실행하여 구독 및 로깅 기능을 테스트합니다.
 
     subscriber = MqttSubscriber()
     subscriber.start()
 
     try:
-        # 백그라운드 루프 유지를 위해 메인 스레드를 대기 상태로 유지
+        # 루프 유지를 위해 메인 스레드를 대기 상태로 유지
         print("\nTEST: 구독자가 실행 중입니다. Ctrl+C를 눌러 종료하세요...")
         while True:
             time.sleep(1)
