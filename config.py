@@ -9,7 +9,7 @@ import torch
 # ==============================================================================
 # 1. 환경 및 경로 설정
 # ==============================================================================
-RASPBERRY_PI_IP = "113.198.234.37"
+RASPBERRY_PI_IP = "113.198.234.35"
 PORT = 8554
 MODEL_PATH = r"E:/yu_task/handpose3d-main/resources/yolov5/runs/train/train_yolov8/weights/best.pt"
 
