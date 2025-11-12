@@ -2,13 +2,13 @@
 
 import numpy as np
 from config import *
-from utilities import iou, expand_and_clamp, calculate_avg_box, compare_boxes
+from utilities import iou, expand_and_clamp  # compare_boxes, calculate_avg_box 등은 필요에 따라 제거
 
 
 class FpManager:
     """
-    YOLO 탐지 결과에 대해 Static/Dynamic FP 필터링 및 쿨다운을 관리하고
-    최종 정탐(TP)을 결정하는 핵심 로직을 캡슐화한 클래스입니다.
+    YOLO 탐지 결과에 대해 Static FP 필터링 및 쿨다운을 관리하고
+    ByteTrack ID 지속성을 기반으로 최종 정탐(TP)을 결정하는 핵심 로직을 캡슐화한 클래스입니다.
     """
 
     def __init__(self, W, H, fps, mqtt_publisher):
@@ -16,17 +16,20 @@ class FpManager:
         self.W, self.H, self.fps = W, H, fps
         self.mqtt_publisher = mqtt_publisher
 
+        # 💡 ByteTrack-MOT 상태 변수: {track_id: current_duration_frames}
+        self.active_track_durations = {}
+
         # FP 상태 변수: 확정 FP, FP 후보, 쿨다운 영역
         self.fp_candidates = {}
         self.false_positive_regions = []
         self.fp_recently_cleared_regions = []
 
-        # Dynamic FP 분석 변수: 베이스라인 측정 관련
-        self.baseline_started = False
-        self.base_start_frame = 0
-        self.baseline_boxes = []
-        self.base_box_avg = None
-        self.current_interval_boxes = []
+        # 🗑️ Dynamic FP 분석 변수 (ByteTrack 대체로 인해 주석 처리)
+        # self.baseline_started = False
+        # self.base_start_frame = 0
+        # self.baseline_boxes = []
+        # self.base_box_avg = None
+        # self.current_interval_boxes = []
 
     # ==========================================================================
     # 1. FP 라이프사이클 관리 (쿨다운 로직)
@@ -57,7 +60,8 @@ class FpManager:
         ]
 
     # ==========================================================================
-    # 2. Static FP 추적 및 확정
+    # 2. Static FP 추적 및 확정 (공간적 마스킹 관리를 위해 유지)
+    # 💡 Note: process_frame에서 이 함수 호출을 중단하여 Static FP 확정을 막음.
     # ==========================================================================
     def _track_static_boxes(self, detections, current_frame_id):
         """지속적으로 나타나는 탐지를 Static FP 후보로 추적하고 확정합니다."""
@@ -66,6 +70,7 @@ class FpManager:
 
         # (1) 박스 추적 카운트 갱신
         for b_box, _ in detections:
+            # 기존 IOU 기반 매칭 로직 유지
             matched_key = next((p_box_tuple for p_box_tuple in self.fp_candidates if
                                 iou(b_box, np.array(p_box_tuple)) > TRACK_IOU_THRESH), None)
             current_box_tuple = tuple(b_box.astype(float))
@@ -87,7 +92,7 @@ class FpManager:
                         'type': 'Static'
                     })
 
-                    # 2. Static FP 확정 MQTT 메시지 발행 (추가된 기능)
+                    # 2. Static FP 확정 MQTT 메시지 발행
                     self.mqtt_publisher.publish_alert(
                         location="Static_Noise_Area",
                         status="FALSE_POSITIVE",
@@ -97,7 +102,6 @@ class FpManager:
                         filter_type="Static"
                     )
 
-                    # 디버깅 출력: 마스킹 시간 표시
                     print(f"FP 확정 [Static, Frame {current_frame_id}]: {FP_LIFESPAN_FRAMES / self.fps:.1f}초 마스킹 시작")
 
         self.false_positive_regions.extend(newly_confirmed)
@@ -105,50 +109,41 @@ class FpManager:
         return newly_confirmed
 
     # ==========================================================================
-    # 3. Dynamic FP 분석 및 확정
+    # 3. Dynamic FP 분석 및 확정 (🗑️ ByteTrack의 Track Duration 필터로 대체됨)
     # ==========================================================================
-    def _analyze_dynamic_boxes(self, filtered_boxes, frame_count):
-        """탐지 영역의 동적 거동(움직임 변화)을 분석하여 Dynamic FP를 확정합니다."""
-        if not filtered_boxes: return
+    # def _analyze_dynamic_boxes(self, filtered_boxes, frame_count):
+    #     """탐지 영역의 동적 거동(움직임 변화)을 분석하여 Dynamic FP를 확정합니다."""
+    #     # 기존 Dynamic FP 로직 전체 주석 처리
+    #     pass
 
-        if not self.baseline_started:
-            self.baseline_started = True
-            self.base_start_frame = frame_count
+    # ==========================================================================
+    # 3. Track Duration 관리 및 TP 결정 (💡 ByteTrack ID 기반)
+    # ==========================================================================
+    def _update_track_durations_and_determine_tp(self, detections_with_id):
+        """ByteTrack ID를 기반으로 각 트랙의 지속 시간을 갱신하고 TP를 결정합니다."""
 
-        # 1. 베이스라인 수집
-        if frame_count < self.base_start_frame + BASELINE_COLLECT_FRAMES:
-            self.baseline_boxes.extend(filtered_boxes)
-            return
+        current_frame_ids = set()
+        final_true_detections = []
 
-        if self.base_box_avg is None and len(self.baseline_boxes) > 0:
-            self.base_box_avg = calculate_avg_box(self.baseline_boxes)
-            return
+        # 1. 현재 프레임의 Track ID 갱신 및 지속 시간 카운트
+        for box, conf, track_id in detections_with_id:
+            if track_id != -1:  # 추적 ID가 부여된 객체만 처리
+                current_frame_ids.add(track_id)
 
-        # 2. 동적 비교 및 확정
-        if self.base_box_avg is not None:
-            self.current_interval_boxes.extend(filtered_boxes)
+                # 지속 프레임 카운트 증가
+                self.active_track_durations[track_id] = self.active_track_durations.get(track_id, 0) + 1
 
-            if frame_count % DYNAMIC_COMPARE_INTERVAL == 0 and self.current_interval_boxes:
-                curr_box_avg = calculate_avg_box(self.current_interval_boxes)
-                result, box_to_mark = compare_boxes(self.base_box_avg, curr_box_avg, self.W, self.H, MOVE_THRESH_RATIO)
+                # 2. TP 임계값 검증: config.py의 TRACK_MIN_DURATION_FRAMES 활용
+                if self.active_track_durations[track_id] >= TRACK_MIN_DURATION_FRAMES:
+                    # 지속 시간을 만족한 객체만 최종 TP 목록에 추가
+                    final_true_detections.append((box, conf))
 
-                if result == "False Positive (Dynamic)" and box_to_mark is not None:
-                    fp_box = expand_and_clamp(list(box_to_mark), 0.08, self.W, self.H)
+        # 3. 끊어진 트랙 정리 (ByteTrack의 track_buffer가 만료된 트랙 제거)
+        keys_to_delete = [tid for tid in self.active_track_durations if tid not in current_frame_ids]
+        for tid in keys_to_delete:
+            del self.active_track_durations[tid]
 
-                    # FP 확정 정보 저장
-                    self.false_positive_regions.append({
-                        'box': fp_box,
-                        'expire_at': frame_count + DYNAMIC_FP_LIFESPAN,
-                        'type': 'Dynamic'
-                    })
-
-                    # Dynamic FP 확정 MQTT 메시지 발행 (기존 기능)
-                    print(f"FP 확정 [Dynamic, Frame {frame_count}]: {DYNAMIC_FP_LIFESPAN / self.fps:.1f}초 마스킹")
-                    self.mqtt_publisher.publish_alert(
-                        location="Dynamic_Noise_Area", status="FALSE_POSITIVE", confidence=0.8,
-                        box_coords=list(box_to_mark), frame_count=frame_count, filter_type="Dynamic"
-                    )
-                self.current_interval_boxes = []
+        return final_true_detections
 
     # ==========================================================================
     # 4. 최종 정탐 (True Positive) 결정
@@ -157,12 +152,20 @@ class FpManager:
         """Static 후보, 쿨다운, 신규 확정 FP 영역을 피해 최종 정탐을 결정합니다."""
         final_true_detections = []
 
+        # (Note: filtered_detections는 이미 Track Duration을 만족한 TP 후보 목록입니다.)
+
+        # 1. 방어 필터 목록 구성
         fp_candidate_boxes = [np.array(b_box_tuple) for b_box_tuple in self.fp_candidates.keys()]  # 방어 2: Static 후보
         fp_cooldown_boxes = [fp['box'] for fp in self.fp_recently_cleared_regions]  # 방어 3: 쿨다운 영역
-        newly_confirmed_boxes = [fp['box'] for fp in newly_confirmed]  # 방어 4: 신규 확정 FP
+        newly_confirmed_boxes = [fp['box'] for fp in newly_confirmed]  # 방어 4: 신규 확정 Static FP
 
+        # 2. 최종 필터링 적용
         for box, conf in filtered_detections:
             is_excluded = False
+
+            # Note: 현재 newly_confirmed와 fp_candidates는 process_frame에서
+            # _track_static_boxes 호출이 중단되어 항상 비어있을 것입니다.
+            # 하지만 안전을 위해 로직은 유지합니다.
 
             if any(iou(box, fp_candidate_box) > TRACK_IOU_THRESH for fp_candidate_box in fp_candidate_boxes):
                 is_excluded = True
@@ -178,26 +181,34 @@ class FpManager:
         return final_true_detections
 
     # ==========================================================================
-    # 5. 메인 실행 메서드
+    # 5. 메인 실행 메서드 (수정됨: Static FP 마스킹 및 추적 비활성화)
     # ==========================================================================
-    def process_frame(self, all_fire_detections, frame_count):
+    def process_frame(self, all_fire_detections_with_id, frame_count):
         """한 프레임에 대한 전체 FP 필터 파이프라인을 실행하고 결과를 반환합니다."""
 
-        self._manage_fp_lifespan(frame_count)
+        self._manage_fp_lifespan(frame_count)  # FP 수명 관리 로직은 유지
 
-        # 1. 1차 필터링: 현재 확정된 FP 영역 제외 (방어 1)
-        filtered_detections = [
-            (box, conf) for box, conf in all_fire_detections
-            if all(iou(box, fp['box']) < FP_MASK_IOU_STRICT for fp in self.false_positive_regions)
-        ]
+        # 1. 1차 필터링: 현재 확정된 Static FP 영역 제외 (방어 1)
+        # 💡 [START] Static FP 마스킹 방어 우회: 모든 감지를 통과
+        filtered_detections = all_fire_detections_with_id
+        # 💡 [END] Static FP 마스킹 방어 우회
 
-        # 2. Static FP 추적 및 확정
-        newly_confirmed = self._track_static_boxes(filtered_detections, frame_count)
+        # 2. Static FP 추적 및 확정 (공간적 FP 관리를 위해 유지)
+        # ---------------------------------------------------------------------
+        # ❌ STATIC FP 추적/확정 로직 비활성화 (Track Duration 검증 목적)
+        # ---------------------------------------------------------------------
+        # detections_only = [(box, conf) for box, conf, _ in filtered_detections]
+        # newly_confirmed = self._track_static_boxes(detections_only, frame_count)
+        # ---------------------------------------------------------------------
 
-        # 3. Dynamic FP 분석 및 확정
-        self._analyze_dynamic_boxes([box for box, conf in filtered_detections], frame_count)
+        newly_confirmed = []  # 💡 Static FP 확정 없이 빈 목록을 반환
 
-        # 4. 최종 정탐 결정 (방어 2, 3, 4 적용)
-        final_true_detections = self._determine_true_positive(filtered_detections, newly_confirmed)
+        # 3. Dynamic FP 분석 및 확정 (🗑️ Dynamic FP 로직 호출 제거)
+
+        # 4. 최종 정탐 결정: Track Duration을 만족하는 객체만 TP 후보로 확정
+        final_tp_candidates = self._update_track_durations_and_determine_tp(filtered_detections)
+
+        # 5. 최종 필터링: Static 후보 및 쿨다운 영역 검사를 통과한 TP만 최종 확정
+        final_true_detections = self._determine_true_positive(final_tp_candidates, newly_confirmed)
 
         return final_true_detections, self.false_positive_regions, self.fp_recently_cleared_regions

@@ -1,0 +1,21 @@
+# ByteTrack Configuration for Fire Detection (bytetrack.yaml)
+
+tracker_type: 'bytetrack'
+
+# High Score Detection 임계값: YOLOv8이 이 점수 이상으로 탐지한 객체를 1차 매칭에 사용
+track_high_thresh: 0.1
+
+# Low Score Detection 임계값: 이 점수 이하의 객체는 버리고, 이와 track_high_thresh 사이의 객체는 2차 매칭에 사용
+track_low_thresh: 0.05
+
+# 새로운 트랙을 시작할 때 요구되는 신뢰도 임계값
+new_track_thresh: 0.1
+
+# 트랙 감지가 끊긴 후 ID를 유지할 프레임 수 (핵심 안정성 파라미터)
+track_buffer: 90
+
+# IoU 매칭 임계값
+match_thresh: 0.8
+
+# 'Static' 및 'Dynamic' 필터링 로직이 ByteTrack으로 대체되었으므로,
+# 이 파일에서 추적의 민감도를 조정하는 것이 가장 중요합니다.
