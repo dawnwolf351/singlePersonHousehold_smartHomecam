@@ -109,7 +109,7 @@ class FpManager:
         return newly_confirmed
 
     # ==========================================================================
-    # 3. Dynamic FP 분석 및 확정 (🗑️ ByteTrack의 Track Duration 필터로 대체됨)
+    # 3. Dynamic FP 분석 및 확정 (ByteTrack의 Track Duration 필터로 대체됨)
     # ==========================================================================
     # def _analyze_dynamic_boxes(self, filtered_boxes, frame_count):
     #     """탐지 영역의 동적 거동(움직임 변화)을 분석하여 Dynamic FP를 확정합니다."""
@@ -117,7 +117,7 @@ class FpManager:
     #     pass
 
     # ==========================================================================
-    # 3. Track Duration 관리 및 TP 결정 (💡 ByteTrack ID 기반)
+    # 3. Track Duration 관리 및 TP 결정 (ByteTrack ID 기반)
     # ==========================================================================
     def _update_track_durations_and_determine_tp(self, detections_with_id):
         """ByteTrack ID를 기반으로 각 트랙의 지속 시간을 갱신하고 TP를 결정합니다."""
@@ -189,19 +189,19 @@ class FpManager:
         self._manage_fp_lifespan(frame_count)  # FP 수명 관리 로직은 유지
 
         # 1. 1차 필터링: 현재 확정된 Static FP 영역 제외 (방어 1)
-        # 💡 [START] Static FP 마스킹 방어 우회: 모든 감지를 통과
+        # [START] Static FP 마스킹 방어 우회: 모든 감지를 통과
         filtered_detections = all_fire_detections_with_id
-        # 💡 [END] Static FP 마스킹 방어 우회
+        # [END] Static FP 마스킹 방어 우회
 
         # 2. Static FP 추적 및 확정 (공간적 FP 관리를 위해 유지)
         # ---------------------------------------------------------------------
-        # ❌ STATIC FP 추적/확정 로직 비활성화 (Track Duration 검증 목적)
+        # STATIC FP 추적/확정 로직 비활성화 (Track Duration 검증 목적)
         # ---------------------------------------------------------------------
         # detections_only = [(box, conf) for box, conf, _ in filtered_detections]
         # newly_confirmed = self._track_static_boxes(detections_only, frame_count)
         # ---------------------------------------------------------------------
 
-        newly_confirmed = []  # 💡 Static FP 확정 없이 빈 목록을 반환
+        newly_confirmed = []  # Static FP 확정 없이 빈 목록을 반환
 
         # 3. Dynamic FP 분석 및 확정 (🗑️ Dynamic FP 로직 호출 제거)
 
