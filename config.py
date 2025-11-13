@@ -9,7 +9,7 @@ import torch
 # ==============================================================================
 # 1. 환경 및 경로 설정
 # ==============================================================================
-RASPBERRY_PI_IP = "113.198.234.35"
+RASPBERRY_PI_IP = "113.198.234.38"
 PORT = 8554
 MODEL_PATH = r"E:/yu_task/handpose3d-main/resources/yolov5/runs/train/train_yolov8/weights/best.pt"
 
@@ -39,8 +39,8 @@ TRACK_MIN_DURATION_FRAMES = int(TRACK_MIN_DURATION_SECONDS * FPS) # 프레임 �
 
 # 2.3 IoU 임계값
 TRACK_IOU_THRESH = 0.93      # Static FP 후보 추적 IoU 임계값
-FP_MASK_IOU_STRICT = 0.65    # 확정된 FP 영역에 대한 YOLO 결과 사전 차단 IoU
-RENDER_FILTER_IOU = 0.65     # 최종 렌더링 시 FP 영역 필터링 IoU
+FP_MASK_IOU_STRICT = 0.89    # 확정된 FP 영역에 대한 YOLO 결과 사전 차단 IoU
+RENDER_FILTER_IOU = 0.89     # 최종 렌더링 시 FP 영역 필터링 IoU
 
 # ==============================================================================
 # 3. MQTT 및 Alert 설정

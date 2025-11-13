@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-MAIN_DECTOR.PY: 실시간 하이브리드 오탐지 필터 파이프라인 메인 실행 모듈 (ID 렌더링 적용)
+MAIN_DECTOR.PY: 실시간 하이브리드 오탐지 필터 파이프라인 메인 실행 모듈
 ================================================================================
 """
 # --- Core Libraries ---
@@ -15,8 +15,9 @@ import numpy as np
 from config import *
 from mqtt_publisher import MqttPublisher
 from fp_manager import FpManager
+from utilities import iou
 
-# 💡 전역 변수: 최초 감지 시점 추적
+# 전역 변수: 최초 감지 시점 추적
 IS_FIRST_DETECTION = True
 
 
@@ -56,7 +57,7 @@ def initialize_system():
     # FPS 속성을 재측정하여 초기화를 유도합니다.
     measured_fps = cap.get(cv2.CAP_PROP_FPS)
 
-    # 인식된 FPS 값이 0이거나 100,000.0 이상인 비정상 값인 경우 config.FPS (30)를 사용합니다.
+    # 인식된 FPS 값이 비정상인 경우 config.FPS (30)를 사용합니다.
     if measured_fps <= 1.0 or measured_fps > 1.0e+5:
         fps = FPS  # Fallback: config.py의 FPS 사용
         print(f"DEBUG: 스트림 FPS 인식 실패 ({measured_fps}). config.FPS ({FPS}) 강제 적용.")
@@ -75,11 +76,10 @@ def initialize_system():
 # ==============================================================================
 ## 2. 렌더링 (UI/UX)
 # ==============================================================================
-# 💡 수정: final_tp_detections가 (box, conf, id) 형식이라고 가정하고 인자를 받음
 def render_frame(frame, final_tp_detections, fp_regions, fp_cooldown_regions, fps, frame_count):
     """프레임에 FP 영역 (확정/쿨다운) 및 최종 TP 박스를 렌더링합니다."""
 
-    # FP 영역 및 쿨다운 영역 렌더링 (Static FP 복구 시 사용)
+    # FP 영역 및 쿨다운 영역 렌더링
     for fp_entry in fp_regions + fp_cooldown_regions:
         fp_box = fp_entry['box']
         x1, y1, x2, y2 = map(int, fp_box)
@@ -101,23 +101,42 @@ def render_frame(frame, final_tp_detections, fp_regions, fp_cooldown_regions, fp
         cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
     # 최종 정탐(TP) 박스 렌더링
-    # 💡 수정: (box, conf, id) 튜플을 언패킹
+    all_active_fp = fp_regions + fp_cooldown_regions  # IoU 계산을 위해 모든 활성 FP 영역을 모음
+
     for detection_info in final_tp_detections:
-        # Tuple length check: (box, conf) or (box, conf, id)?
+        # 감지 정보 파싱: (box, conf) 또는 (box, conf, id)
         if len(detection_info) == 2:
             box, conf = detection_info
             track_id = None
         else:
             box, conf, track_id = detection_info
 
+        # TP가 활성 FP 영역과 겹치면 렌더링에서 제외 (필터)
+        is_masked = False
+        for fp_entry in all_active_fp:
+            # RENDER_FILTER_IOU 이상 겹치면 마스킹 처리
+            if iou(box, fp_entry['box']) > RENDER_FILTER_IOU:
+                is_masked = True
+                break
+
+        if is_masked:
+            continue
+
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(frame, (x1, y1), (x2, y2), BOX_COLOR, BOX_THICKNESS)
 
-        # 💡 ID 정보를 포함한 레이블 생성
-        id_str = f" ID:{track_id}" if track_id is not None else ""
-        label = f'Fire (TP) {conf:.2f}{id_str}'
+        # IoU 시각화 정보 생성 (디버깅용)
+        max_iou_with_fp = 0.0
+        for fp_entry in all_active_fp:
+            current_iou = iou(box, fp_entry['box'])
+            if current_iou > max_iou_with_fp:
+                max_iou_with_fp = current_iou
 
-        # 💡 텍스트 위치: 좌측 하단 바깥쪽 (y2 + 25)
+        id_str = f" ID:{track_id}" if track_id is not None else ""
+        iou_str = f" IOU:{max_iou_with_fp:.2f}" if max_iou_with_fp > 0.1 else ""
+        label = f'Fire (TP) {conf:.2f}{id_str}{iou_str}'
+
+        # 텍스트 위치: 좌측 하단 바깥쪽
         cv2.putText(frame, label, (x1, y2 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.9, BOX_COLOR, 2)
 
     cv2.imshow('Real-time Video Stream (YOLO + Hybrid FP Filter)', frame)
@@ -144,7 +163,7 @@ def main_loop(model, cap, fps, mqtt_publisher, fp_manager):
             frame_count += 1
             current_time = time.time()
 
-            # A. YOLO 추론 및 ByteTrack 추적 수행 (model.track으로 변경)
+            # A. YOLO 추론 및 ByteTrack 추적 수행
             results = model.track(
                 frame,
                 verbose=False,
@@ -155,77 +174,48 @@ def main_loop(model, cap, fps, mqtt_publisher, fp_manager):
                 tracker='bytetrack.yaml'  # ByteTrack 설정 파일 지정
             )[0]
 
-            # ---------------------------------------------
-            # 💡 ByteTrack ID 할당 정보 수집 및 디버깅 데이터 준비
-            # ---------------------------------------------
+            # B. 탐지 결과에서 Fire 클래스 및 ByteTrack ID 추출
             all_fire_detections_with_id = []
-            total_detections = 0
             track_ids = results.boxes.id.cpu().numpy() if results.boxes.id is not None else []
             track_ids_list = track_ids.tolist() if len(track_ids) > 0 else []
             id_index = 0
 
             for box, conf, cls in zip(results.boxes.xyxy, results.boxes.conf, results.boxes.cls):
                 if model.names[int(cls)] == "fire":
-                    total_detections += 1
                     final_track_id = int(track_ids_list[id_index]) if id_index < len(track_ids_list) else -1
                     all_fire_detections_with_id.append((box.cpu().numpy(), float(conf.cpu().numpy()), final_track_id))
                     id_index += 1
 
-            # ---------------------------------------------
-            # 💡 ByteTrack 할당 성공 여부 출력 (최초 감지 시점 + 60 프레임마다)
-            # ---------------------------------------------
+            # 유효한 추적 ID 개수 계산
+            valid_track_ids = [tid for _, _, tid in all_fire_detections_with_id if tid != -1]
+            current_id_count = len(valid_track_ids)
 
-            is_debug_frame = (frame_count % 60 == 0)
-            is_first_detection_now = (total_detections > 0 and IS_FIRST_DETECTION)
-
-            if is_debug_frame or is_first_detection_now:
-
-                if is_first_detection_now:
-                    IS_FIRST_DETECTION = False
-
-                print("-" * 50)
-                print(f"DEBUG: Frame {frame_count} - Total Fire Detections: {total_detections}")
-
-                if total_detections > 0:
-                    valid_track_ids = [tid for _, _, tid in all_fire_detections_with_id if tid != -1]
-
-                    if len(valid_track_ids) > 0:
-                        all_ids_str = ', '.join(map(str, valid_track_ids))
-                        print(
-                            f"DEBUG: ✅ Track IDs Assigned Successfully. Assigned IDs: {all_ids_str}, Count: {len(valid_track_ids)}")
-                    else:
-                        print(f"DEBUG: ❌ Object Detected, BUT No valid Track ID Assigned (All IDs are -1 or None).")
-                        print(f"         --> 🚨 Suspected Cause: 'new_track_thresh' is too high.")
-
-                print("-" * 50)
-            # ---------------------------------------------
-            # 💡 ByteTrack ID 할당 확인 디버깅 코드 END
-            # ---------------------------------------------
-
-            # B. FP Manager를 통한 필터링 및 TP 결정
+            # C. FP Manager를 통한 최종 필터링 및 TP 결정
             final_true_detections, fp_regions, fp_cooldown_regions = fp_manager.process_frame(
                 all_fire_detections_with_id, frame_count
             )
-            # Note: fp_manager.py의 TP 반환 형식을 (box, conf, id)로 수정해야 ID가 렌더링됩니다.
 
-            # C. 최종 정탐 알림 발행 (시간 쿨다운 적용)
+            # D. 최종 정탐 알림 발행 (시간 쿨다운 적용)
             if final_true_detections and current_time - last_alert_time > ALERT_COOLDOWN_SECONDS:
-                # 💡 수정: final_true_detections가 (box, conf, id) 형식일 수 있음
-                best_conf = final_true_detections[0][1]
-                best_box = final_true_detections[0][0]
+                best_detection = final_true_detections[0]
+                best_box, best_conf, best_id = best_detection
 
-                # 최종 TP 알림 발생 시 명시적인 로그 출력
+                # TP 발행 로그 출력
+                print("=" * 60)
                 print(f"[TRUE_POSITIVE] Frame {frame_count}: Confirmed Fire Detected!")
+                print(f"  > FRAME COUNT: {frame_count}")
+                print(f"  > ID COUNT (추적 객체 수): {current_id_count}")
+                print(f"  > TRACK ID (발행): {best_id}, Confidence: {best_conf:.3f}")
 
-                # MQTT 발행은 (box, conf) 기반으로 진행
+                # MQTT 발행 (성공 로그는 mqtt_publisher.py에서 출력됨)
                 mqtt_publisher.publish_alert(
                     location="Living_Room_Main", status="CONFIRMED_FIRE_DETECTED", confidence=float(best_conf),
                     box_coords=list(best_box), frame_count=frame_count, filter_type="Track_Duration"
                 )
                 last_alert_time = current_time
-                print(f"[CONFIRMED_FIRE_DETECTED] Frame {frame_count}: MQTT 발행 성공!")
+                print("=" * 60)
 
-            # D. 렌더링 및 종료 확인
+            # E. 렌더링 및 종료 확인
             render_frame(frame, final_true_detections, fp_regions, fp_cooldown_regions, fps, frame_count)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
